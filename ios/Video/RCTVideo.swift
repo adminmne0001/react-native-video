@@ -548,9 +548,78 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
                 do {
                     guard let self else { throw NSError(domain: "", code: 0, userInfo: nil) }
 
-                    let playerItem = try await self.preparePlayerItem()
-                    try await self.setupPlayer(playerItem: playerItem)
-                } catch {
+                    if let startPosition = self._source?.startPosition {
+                        self._startPosition = Float64(startPosition) / 1000
+                    }
+
+                    #if USE_VIDEO_CACHING
+                        if self._videoCache.shouldCache(source: source, textTracks: self._textTracks) {
+                            return self._videoCache.playerItemForSourceUsingCache(uri: source.uri, assetOptions: assetOptions)
+                        }
+                    #endif
+
+                    if self._drm != nil || self._localSourceEncryptionKeyScheme != nil {
+                        self._resouceLoaderDelegate = RCTResourceLoaderDelegate(
+                            asset: asset,
+                            drm: self._drm,
+                            localSourceEncryptionKeyScheme: self._localSourceEncryptionKeyScheme,
+                            onVideoError: self.onVideoError,
+                            onGetLicense: self.onGetLicense,
+                            reactTag: self.reactTag
+                        )
+                    }
+
+                    return self.playerItemPrepareText(asset: asset, assetOptions: assetOptions, uri: source.uri ?? "")
+                }.then { [weak self] (playerItem: AVPlayerItem!) in
+                    guard let self else { throw NSError(domain: "", code: 0, userInfo: nil) }
+                    if !self.isSetSourceOngoing {
+                        DebugLog("setSrc has been canceled last step")
+                        return
+                    }
+                    self._player?.pause()
+                    self._playerItem = playerItem
+                    self._playerObserver.playerItem = self._playerItem
+                    self.setPreferredForwardBufferDuration(self._preferredForwardBufferDuration)
+                    self.setPlaybackRange(playerItem, withVideoStart: self._source?.cropStart, withVideoEnd: self._source?.cropEnd)
+                    self.setFilter(self._filterName)
+                    if let maxBitRate = self._maxBitRate {
+                        self._playerItem?.preferredPeakBitRate = Double(maxBitRate)
+                    }
+
+                    self._player = self._player ?? AVPlayer()
+                    DispatchQueue.global(qos: .default).async {
+                        self._player?.replaceCurrentItem(with: playerItem)
+                    }
+
+                    self._playerObserver.player = self._player
+                    self.applyModifiers()
+                    self._player?.actionAtItemEnd = .none
+
+                    if #available(iOS 10.0, *) {
+                        self.setAutomaticallyWaitsToMinimizeStalling(self._automaticallyWaitsToMinimizeStalling)
+                    }
+
+                    #if USE_GOOGLE_IMA
+                        if self._adTagUrl != nil {
+                            // Set up your content playhead and contentComplete callback.
+                            self._contentPlayhead = IMAAVPlayerContentPlayhead(avPlayer: self._player!)
+
+                            self._imaAdsManager.setUpAdsLoader()
+                        }
+                    #endif
+                    // Perform on next run loop, otherwise onVideoLoadStart is nil
+                    self.onVideoLoadStart?([
+                        "src": [
+                            "uri": self._source?.uri ?? NSNull(),
+                            "type": self._source?.type ?? NSNull(),
+                            "isNetwork": NSNumber(value: self._source?.isNetwork ?? false),
+                        ],
+                        "drm": self._drm?.json ?? NSNull(),
+                        "target": self.reactTag,
+                    ])
+                    self.isSetSourceOngoing = false
+                    self.applyNextSource()
+                }.catch { error in
                     DebugLog("An error occurred: \(error.localizedDescription)")
 
                     if let self {
